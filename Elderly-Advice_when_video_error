@@ -1,0 +1,306 @@
+// ==UserScript==
+// @name         Video error: full-window warning
+// @namespace    videoerrorwarn.q9m4
+// @version      1.2
+// @description  For elderly or low-vision users: when a video player on the listed sites shows an error (or is stuck while offline), cover the window with a huge warning. Disappears when the error does. Detects Portuguese and English error messages.
+// @match        *://*.rr.pt/*
+// @match        *://*.rfm.pt/*
+// @match        *://rfm.sapo.pt/*
+// @match        *://megahits.sapo.pt/*
+// @match        *://*.nostv.pt/*
+// @match        *://*.youtube.com/*
+// @match        *://*.youtube-nocookie.com/*
+// @match        *://*.rtp.pt/*
+// @match        *://*.sic.pt/*
+// @match        *://*.sicnoticias.pt/*
+// @match        *://tviplayer.iol.pt/*
+// @match        *://tvi.iol.pt/*
+// @match        *://cnnportugal.iol.pt/*
+// @match        *://*.tsf.pt/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ============================== SETTINGS ==============================
+  // \n = line break. Fewer words per line = bigger letters.
+  const MSG_INTERNET = 'AfonsoHenriques diz:\nInternet morreu.\nEspera, ou Reinicia.';
+  const MSG_OTHER    = 'AfonsoHenriques diz:\nAbre Outra Vez,\nEspera, ou Desiste.';
+
+  const DELAY_MS       = 2000;   // error must stay this long before the warning shows (stutter filter)
+  const CHECK_EVERY_MS = 500;
+  const BORDER_V       = '5vh';  // how much of the site stays visible above/below the warning
+  const BORDER_H       = '5vw';  // ...and left/right
+  const BG_COLOR       = '#FFE600';  // yellow
+  const TEXT_COLOR     = '#000000';  // black
+  const OFFLINE_STALL_TRIGGER = true; // also warn when Chrome says "offline" AND a video is stuck loading
+  const SPEAK          = false;  // true = also read the message aloud (Portuguese voice)
+  const LOG            = true;   // DevTools console, prefixed [VideoErrorWarn]
+  // ======================================================================
+
+  const KEY = '__videoErrorWarn_q9m4';
+  const isTop = window.top === window;
+  const log = (...a) => { if (LOG) console.log('[VideoErrorWarn]', location.hostname, ...a); };
+
+  // ---------- text patterns (only ever applied to text already found in an error-looking place) ----------
+  const ERROR_TEXT = new RegExp([
+    '\\b(erro|error)\\b',                       // word boundary: "ferro"/"terror" don't count
+    // Portuguese (PT + BR)
+    'n[ãa]o (pode|p[ôo]de|foi poss[íi]vel|[ée] poss[íi]vel)( ser)? (reproduzi|carrega)',
+    'ocorreu um (erro|problema)',
+    'sem (liga[çc][ãa]o|conex[ãa]o|internet|rede|acesso)',
+    'verifique a (sua )?(liga[çc][ãa]o|conex[ãa]o|rede)',
+    'liga[çc][ãa]o (perdida|interrompida)', 'perdeu a (liga[çc][ãa]o|conex[ãa]o)',
+    'tente (novamente|de novo|mais tarde)',
+    'n[ãa]o est[áa] dispon[íi]vel', 'indispon[íi]vel',
+    '\\bfalh(a|ou)\\b',
+    // English
+    'something went wrong', 'an error (has )?occurred', "can(no|')t be played",
+    "(unable to|could not|couldn'?t|can'?t|cannot) (play|load)",
+    'playback (failed|error)', 'failed to load', 'video (is )?unavailable',
+    "check your (internet |network )?connection", "you'?re offline", 'connection (lost|failed|problem)',
+    'try again',
+    // both
+    '\\boffline\\b',
+  ].join('|'), 'i');
+
+  const INTERNET_TEXT = /internet|liga[çc][ãa]o|conex[ãa]o|conectividade|\brede\b|wi-?fi|network|offline|connect/i;
+
+  // JW Player codes shown as "problem with your internet connection", plus network timeouts.
+  const JW_INTERNET_CODES = new Set([221000, 230002, 232002, 102001, 202001, 232001, 233001, 241001]);
+
+  // ---------- helpers ----------
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    if (el.checkVisibility) return el.checkVisibility({ opacityProperty: true, visibilityProperty: true });
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) > 0;
+  }
+  const cleanText = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
+  const KNOWN_PLAYERS = '.jwplayer, #movie_player, #shorts-player, .html5-video-player';
+
+  // Media the user actually tried to play (so a broken decorative video doesn't count).
+  const playAttempted = new WeakSet();
+  document.addEventListener('play', e => { if (e.target instanceof HTMLMediaElement) playAttempted.add(e.target); }, true);
+
+  // ---------- detectors: each returns a list of { source, text, internet } ----------
+
+  // 1) JW Player (rr.pt): the player itself marks the error with classes; we read its own error box.
+  function detectJW() {
+    const out = [];
+    document.querySelectorAll('.jwplayer.jw-state-error, .jw-error').forEach(box => {
+      const msg = box.querySelector('.jw-error-msg');
+      if (!isVisible(msg)) return;
+      const text = cleanText(box.querySelector('.jw-error-text') || msg);
+      const m = text.match(/(\d{6})\D*$/);       // "(Código de Erro: 221000)"
+      const code = m ? Number(m[1]) : null;
+      out.push({ source: 'jwplayer', text, internet: JW_INTERNET_CODES.has(code) || INTERNET_TEXT.test(text) });
+    });
+    return out;
+  }
+
+  // 2) YouTube: the real player's error screen only (not hover previews).
+  function detectYouTube() {
+    const out = [];
+    document.querySelectorAll('#movie_player .ytp-error, #shorts-player .ytp-error').forEach(err => {
+      if (!isVisible(err)) return;
+      const text = cleanText(err);
+      out.push({ source: 'youtube', text, internet: INTERNET_TEXT.test(text) });
+    });
+    return out;
+  }
+
+  // 3) Plain <video> with the browser's own error flag set (no text matching at all).
+  function detectNative() {
+    const out = [];
+    document.querySelectorAll('video').forEach(v => {
+      if (!v.error || v.closest(KNOWN_PLAYERS)) return;
+      if (!playAttempted.has(v) && !v.autoplay) return;
+      const r = v.getBoundingClientRect();
+      if (r.width < 200 || r.height < 112 || !isVisible(v)) return;
+      out.push({ source: 'native', text: 'MediaError ' + v.error.code, internet: v.error.code === 2 /* NETWORK */ });
+    });
+    return out;
+  }
+
+  // 4) Unknown players (NOS TV, RTP, SIC...): an element must pass ALL of:
+  //    a) looks like an error box by markup (role="alert" or class/id containing error/erro/offline/fail)
+  //    b) is visible, with short text (a message, not an article)
+  //    c) text matches ERROR_TEXT
+  //    d) sits inside a player-sized box that contains a <video>, and that box isn't a whole page section
+  function detectGeneric() {
+    const out = [];
+    const sel = '[role="alert"], [class*="erro" i], [id*="erro" i], [class*="offline" i], [class*="fail" i]';
+    document.querySelectorAll(sel).forEach(el => {
+      if (el.closest(KNOWN_PLAYERS)) return;             // handled by the specific detectors
+      if (!isVisible(el)) return;
+      const text = cleanText(el);
+      if (text.length < 4 || text.length > 300 || !ERROR_TEXT.test(text)) return;
+
+      let box = el.parentElement, depth = 0;
+      while (box && depth < 8 && !box.querySelector('video')) { box = box.parentElement; depth++; }
+      if (!box || !box.querySelector('video') || box === document.body || box === document.documentElement) return;
+      if (cleanText(box).length > 2500) return;          // too much text = page section, not a player
+
+      const er = el.getBoundingClientRect();
+      const cx = er.left + er.width / 2, cy = er.top + er.height / 2;
+      const contains = r => cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom;
+      const vids = [...box.querySelectorAll('video')].filter(v => {
+        const r = v.getBoundingClientRect();
+        return r.width >= 200 && r.height >= 112 && isVisible(v);
+      });
+      if (vids.length) {
+        // The message must sit ON TOP of the video picture.
+        if (!vids.some(v => contains(v.getBoundingClientRect()))) return;
+      } else {
+        // Player hid its video: only accept a tight wrapper, and the message must be inside it.
+        const r = box.getBoundingClientRect();
+        if (depth > 3 || r.width < 200 || r.height < 112 || !contains(r)) return;
+      }
+
+      out.push({ source: 'generic', text, internet: INTERNET_TEXT.test(text) });
+    });
+    return out;
+  }
+
+  // 5) Chrome says offline AND a player is stuck loading (some players just spin forever, no error).
+  function detectOfflineStall() {
+    if (!OFFLINE_STALL_TRIGGER || navigator.onLine !== false) return [];
+    const stuck =
+      [...document.querySelectorAll('.jwplayer.jw-state-buffering, #movie_player.buffering-mode')].some(isVisible) ||
+      [...document.querySelectorAll('video')].some(v => {
+        if (v.paused || v.readyState >= 3) return false;
+        const r = v.getBoundingClientRect();
+        return r.width >= 200 && r.height >= 112 && isVisible(v);
+      });
+    return stuck ? [{ source: 'offline-stall', text: 'navigator.onLine = false', internet: true }] : [];
+  }
+
+  function detectAll() {
+    const found = [];
+    for (const d of [detectJW, detectYouTube, detectNative, detectGeneric, detectOfflineStall]) {
+      try { found.push(...d()); } catch (e) { log('detector failed', d.name, e); }
+    }
+    return found;
+  }
+
+  // ---------- frames: a player inside an iframe reports to the tab's main page ----------
+  const frameReports = new Map(); // source window -> { internet, t }
+  if (isTop) {
+    window.addEventListener('message', e => {
+      const d = e.data;
+      if (!d || typeof d !== 'object' || d[KEY] !== true) return;
+      if (d.active) frameReports.set(e.source, { internet: !!d.internet, t: Date.now() });
+      else frameReports.delete(e.source);
+    });
+  }
+
+  // ---------- the warning ----------
+  let host = null, box = null, shownMsg = null;
+
+  function buildOverlay() {
+    host = document.createElement('div');
+    host.setAttribute('data-video-error-warn-q9m4', '');
+    host.style.cssText = `all: initial !important; position: fixed !important; inset: ${BORDER_V} ${BORDER_H} !important;
+      z-index: 2147483647 !important; display: block !important;`;
+    const root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = `<style>
+        .b { position: absolute; inset: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: center;
+             background: ${BG_COLOR}; color: ${TEXT_COLOR}; border: 1.5vmin solid ${TEXT_COLOR}; border-radius: 2vmin;
+             padding: 2vmin; overflow: hidden; cursor: pointer; box-shadow: 0 0 0 100vmax rgba(0,0,0,.35);
+             font-family: Verdana, Arial, Helvetica, sans-serif; font-weight: 900; line-height: 1.08;
+             text-align: center; white-space: pre-line; overflow-wrap: normal; word-break: keep-all; }
+      </style><div class="b" role="alert" aria-live="assertive"></div>`;
+    box = root.querySelector('.b');
+    box.addEventListener('click', () => { dismissed = true; hideOverlay(); });
+  }
+
+  // Biggest font size at which the text still fits inside the box.
+  function fitText() {
+    if (!box) return;
+    let lo = 8, hi = Math.max(window.innerWidth, window.innerHeight);
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      box.style.fontSize = mid + 'px';
+      if (box.scrollWidth <= box.clientWidth && box.scrollHeight <= box.clientHeight) lo = mid; else hi = mid;
+    }
+    box.style.fontSize = lo + 'px';
+  }
+
+  function placeOverlay() {
+    const fs = document.fullscreenElement;
+    if (fs instanceof HTMLMediaElement) { document.exitFullscreen().catch(() => {}); } // a bare <video> can't hold our box
+    const parent = (fs && !(fs instanceof HTMLMediaElement)) ? fs : document.documentElement;
+    if (host.parentNode === parent) return false;
+    parent.appendChild(host);
+    return true;
+  }
+
+  function showOverlay(msg) {
+    if (!host) buildOverlay();
+    const moved = placeOverlay();
+    if (shownMsg === msg && !moved) return;   // already showing; nothing to redo
+    if (shownMsg !== msg) {
+      box.textContent = msg;
+      shownMsg = msg;
+      if (SPEAK && 'speechSynthesis' in window) {
+        try {
+          const u = new SpeechSynthesisUtterance(msg.replace(/\n/g, ' '));
+          u.lang = 'pt-PT'; speechSynthesis.cancel(); speechSynthesis.speak(u);
+        } catch (e) {}
+      }
+    }
+    fitText();
+  }
+
+  function hideOverlay() {
+    if (host && host.parentNode) host.remove();
+    shownMsg = null;
+  }
+
+  window.addEventListener('resize', () => { if (shownMsg) fitText(); });
+  document.addEventListener('fullscreenchange', () => { if (shownMsg) { placeOverlay(); fitText(); } });
+
+  // ---------- main loop ----------
+  let errorSince = 0, dismissed = false, lastSig = '';
+
+  function tick() {
+    const local = detectAll();
+    const localActive = local.length > 0;
+    const localInternet = local.some(f => f.internet) || (localActive && navigator.onLine === false);
+
+    if (!isTop) {
+      // In an iframe: report to the main page (heartbeat while active), never draw here.
+      if (localActive || lastSig === 'on') {
+        try { window.top.postMessage({ [KEY]: true, active: localActive, internet: localInternet }, '*'); } catch (e) {}
+      }
+      lastSig = localActive ? 'on' : '';
+      return;
+    }
+
+    const now = Date.now();
+    for (const [src, r] of frameReports) if (now - r.t > 3000) frameReports.delete(src); // frame went quiet
+    const frames = [...frameReports.values()];
+    const active = localActive || frames.length > 0;
+    const internet = localInternet || frames.some(r => r.internet);
+
+    if (!active) {
+      if (errorSince) log('error gone');
+      errorSince = 0; dismissed = false; hideOverlay();
+      return;
+    }
+    if (!errorSince) { errorSince = now; log('error seen, waiting', DELAY_MS, 'ms', local); }
+    if (now - errorSince < DELAY_MS || dismissed) return;
+    const msg = internet ? MSG_INTERNET : MSG_OTHER;
+    if (shownMsg !== msg) log('showing warning', { internet, local, frames: frames.length });
+    showOverlay(msg);
+  }
+
+  setInterval(() => { try { tick(); } catch (e) { log('tick failed', e); } }, CHECK_EVERY_MS);
+  window.addEventListener('offline', () => log('browser went offline'));
+  window.addEventListener('online', () => log('browser back online'));
+})();
