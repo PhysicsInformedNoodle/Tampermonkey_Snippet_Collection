@@ -1,21 +1,24 @@
 // ==UserScript==
-// @name         Volume floor: muted or <10% -> 20%
+// @name         Elderly - Volume floor: never muted, never below 20%
 // @namespace    volumefloor.k7q2
-// @version      1.3
-// @description  Keeps video/audio audible on listed sites (for elderly or low-vision users): blocks mute buttons, unmutes, and raises volume below 10% to 20%. Never lowers volume.
+// @version      1.4
+// @description  Keeps video/audio audible on listed sites (for elderly or low-vision users): blocks mute buttons, unmutes, and raises any volume below 20% to 20%. Never lowers volume.
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
+// @sandbox      raw
 // ==/UserScript==
 
 (function () {
   'use strict';
 
   // ============================== SETTINGS ==============================
-  const MIN_VOLUME     = 0.10;  // below this counts as "too quiet" (0 = silent, 1 = 100%)
+  const MIN_VOLUME     = 0.20;  // below this counts as "too quiet" (0 = silent, 1 = 100%)
   const TARGET_VOLUME  = 0.20;  // raise to this
   const CHECK_EVERY_MS = 1000;  // safety-net re-check interval
   const BLOCK_MUTE     = true;  // swallow clicks on player mute buttons and the "m" mute shortcut
+  const LOCK_SETTERS   = true;  // refuse "muted = true" and volumes below the floor at the JavaScript level
+                                // (needed for players drawn on a canvas, like NOS TV's Flutter app)
   const LOG            = true;  // messages in DevTools console, prefixed [VolumeFloor]
 
   // An entry matches that site AND all its subdomains ('rtp.pt' also covers 'www.rtp.pt').
@@ -69,6 +72,42 @@
   // Chrome pauses a video that gets unmuted before the user has clicked/typed on the page.
   // So: unmuting waits for the first click/keypress; raising an unmuted quiet volume never waits.
   const canUnmute = () => !navigator.userActivation || navigator.userActivation.hasBeenActive;
+
+  // ---------- lock at the JavaScript level ----------
+  // Every player, whatever its buttons look like, ends up doing  video.muted = true  or  video.volume = x.
+  // We wrap those two setters on all <video>/<audio> elements of the page:
+  //   muted = true      -> ignored (once the user has clicked/typed; before that, sites need muted autoplay)
+  //   volume < floor    -> raised to the floor      (anything else passes through untouched)
+  // YouTube: only the main/Shorts player is locked, so homepage hover previews can stay muted.
+  let lastLockLog = 0;
+  const lockLog = (...a) => { const t = Date.now(); if (t - lastLockLog > 2000) { lastLockLog = t; log(...a); } };
+  const governed = el => !isYouTube || !!(el && el.closest && el.closest('#movie_player, #shorts-player'));
+  if (LOCK_SETTERS) {
+    try {
+      const proto = HTMLMediaElement.prototype;
+      const mutedD = Object.getOwnPropertyDescriptor(proto, 'muted');
+      const volD = Object.getOwnPropertyDescriptor(proto, 'volume');
+      if (mutedD && mutedD.set && volD && volD.set) {
+        Object.defineProperty(proto, 'muted', {
+          configurable: true, enumerable: mutedD.enumerable, get: mutedD.get,
+          set(v) {
+            if (v && canUnmute() && governed(this)) { lockLog('refused muted = true'); schedule(); return; }
+            mutedD.set.call(this, v);
+          },
+        });
+        Object.defineProperty(proto, 'volume', {
+          configurable: true, enumerable: volD.enumerable, get: volD.get,
+          set(v) {
+            if (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < TARGET_VOLUME && governed(this)) {
+              lockLog('raised volume', v, '->', TARGET_VOLUME);
+              v = TARGET_VOLUME;
+            }
+            volD.set.call(this, v);
+          },
+        });
+      }
+    } catch (e) { log('could not lock setters', e); }
+  }
 
   // Anti-ping-pong: if a site keeps undoing us, back off instead of flickering.
   let fixTimes = [];
@@ -212,5 +251,5 @@
   ['pointerdown', 'keydown'].forEach(ev => window.addEventListener(ev, schedule, true));
   setInterval(schedule, CHECK_EVERY_MS);
   schedule();
-  log('running', { blockMute: BLOCK_MUTE });
+  log('running', { blockMute: BLOCK_MUTE, lockSetters: LOCK_SETTERS, floor: TARGET_VOLUME });
 })();
