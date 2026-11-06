@@ -1,0 +1,216 @@
+// ==UserScript==
+// @name         Volume floor: muted or <10% -> 20%
+// @namespace    volumefloor.k7q2
+// @version      1.3
+// @description  Keeps video/audio audible on listed sites (for elderly or low-vision users): blocks mute buttons, unmutes, and raises volume below 10% to 20%. Never lowers volume.
+// @match        *://*/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ============================== SETTINGS ==============================
+  const MIN_VOLUME     = 0.10;  // below this counts as "too quiet" (0 = silent, 1 = 100%)
+  const TARGET_VOLUME  = 0.20;  // raise to this
+  const CHECK_EVERY_MS = 1000;  // safety-net re-check interval
+  const BLOCK_MUTE     = true;  // swallow clicks on player mute buttons and the "m" mute shortcut
+  const LOG            = true;  // messages in DevTools console, prefixed [VolumeFloor]
+
+  // An entry matches that site AND all its subdomains ('rtp.pt' also covers 'www.rtp.pt').
+  // The script only acts when BOTH the tab's main site and the frame the video is in are listed.
+  const SITES = [
+    'rr.pt',                 // Renascença
+    'rfm.sapo.pt', 'rfm.pt', // RFM
+    'megahits.sapo.pt',      // Mega Hits
+    'nostv.pt',              // NOS TV web
+    'youtube.com',
+    'youtube-nocookie.com',  // privacy-mode YouTube embeds
+    'rtp.pt',                // RTP Play, RTP Notícias, Antena 1/2/3
+    'sic.pt',                // SIC, OPTO (opto.sic.pt)
+    'sicnoticias.pt',
+    'tviplayer.iol.pt',
+    'tvi.iol.pt',
+    'cnnportugal.iol.pt',
+    'tsf.pt',
+
+    // --- Maybe: ad-heavy sites with muted autoplay/sticky players. Uncomment at your own risk. ---
+    // 'observador.pt',
+    // 'cmjornal.pt',
+    // 'cmtv.pt',
+    // 'publico.pt',
+    // 'expresso.pt',
+    // 'meogo.meo.pt',
+    // 'vimeo.com',
+    // 'dailymotion.com',
+  ];
+  // ======================================================================
+
+  // A usable volume: a real, finite number in 0..max. Anything else (null, undefined, NaN) = leave it alone.
+  const okVol = (v, max) => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= max;
+
+  const onList = h => !!h && SITES.some(s => h === s || h.endsWith('.' + s));
+
+  function topHostname() {
+    if (window.top === window) return location.hostname;
+    const anc = location.ancestorOrigins; // Chrome: origins of parent frames, last = the tab's site
+    if (anc && anc.length) { try { return new URL(anc[anc.length - 1]).hostname; } catch (e) {} }
+    try { return window.top.location.hostname; } catch (e) {}
+    try { return new URL(document.referrer).hostname; } catch (e) {}
+    return null;
+  }
+
+  if (!onList(location.hostname) || !onList(topHostname())) return;
+
+  const log = (...a) => { if (LOG) console.log('[VolumeFloor]', location.hostname, ...a); };
+  const isYouTube = /(^|\.)youtube(-nocookie)?\.com$/.test(location.hostname);
+
+  // Chrome pauses a video that gets unmuted before the user has clicked/typed on the page.
+  // So: unmuting waits for the first click/keypress; raising an unmuted quiet volume never waits.
+  const canUnmute = () => !navigator.userActivation || navigator.userActivation.hasBeenActive;
+
+  // Anti-ping-pong: if a site keeps undoing us, back off instead of flickering.
+  let fixTimes = [];
+  let backoffUntil = 0;
+  function allowFix() {
+    const now = Date.now();
+    if (now < backoffUntil) return false;
+    fixTimes = fixTimes.filter(t => now - t < 10000);
+    if (fixTimes.length >= 8) {
+      backoffUntil = now + 30000;
+      log('site keeps undoing the fix; backing off for 30 s');
+      return false;
+    }
+    fixTimes.push(now);
+    return true;
+  }
+
+  // Plain <video>/<audio>: the browser's own scale, always 0..1 on every site.
+  function fixElement(m) {
+    try {
+      const vol = m.volume;
+      if (!okVol(vol, 1)) return;                // missing/broken volume: don't touch
+      const tooQuiet = vol < MIN_VOLUME;
+      const unmute = m.muted === true && canUnmute();
+      if (!tooQuiet && !unmute) return;
+      if (!allowFix()) return;
+      if (tooQuiet) m.volume = Math.max(vol, TARGET_VOLUME); // max() = can only go up
+      if (unmute) m.muted = false;
+      log('element', { before: vol, after: m.volume, unmuted: unmute });
+    } catch (e) { log('element skipped (error)', e); }
+  }
+
+  // YouTube player API: 0..100 scale. Returns false if the API isn't there.
+  function fixYouTube(p) {
+    if (typeof p.getVolume !== 'function' || typeof p.isMuted !== 'function') return false;
+    const vol = p.getVolume();
+    if (!okVol(vol, 100)) return false;
+    const tooQuiet = vol < MIN_VOLUME * 100;
+    const unmute = p.isMuted() === true && canUnmute();
+    if (!tooQuiet && !unmute) return true;
+    if (!allowFix()) return true;
+    if (tooQuiet) p.setVolume(Math.max(vol, TARGET_VOLUME * 100));
+    if (unmute) p.unMute();
+    log('youtube', { before: vol, unmuted: unmute });
+    return true;
+  }
+
+  // JW Player API (rr.pt and many news sites): 0..100 scale. Returns false if the API isn't there.
+  function fixJW(p) {
+    if (typeof p.getVolume !== 'function' || typeof p.getMute !== 'function') return false;
+    const vol = p.getVolume();
+    if (!okVol(vol, 100)) return false;
+    const tooQuiet = vol < MIN_VOLUME * 100;
+    const unmute = p.getMute() === true && canUnmute();
+    if (!tooQuiet && !unmute) return true;
+    if (!allowFix()) return true;
+    if (tooQuiet) p.setVolume(Math.max(vol, TARGET_VOLUME * 100));
+    if (unmute) p.setMute(false);
+    log('jwplayer', { before: vol, unmuted: unmute });
+    return true;
+  }
+
+  function checkAll() {
+    // YouTube: only the real players. Hover previews on the homepage stay untouched.
+    if (isYouTube) {
+      for (const id of ['movie_player', 'shorts-player']) {
+        const p = document.getElementById(id);
+        if (!p) continue;
+        const v = p.querySelector('video');
+        try { if (!fixYouTube(p) && v) fixElement(v); } catch (e) { log('youtube error', e); }
+      }
+      return;
+    }
+
+    const handled = new Set();
+
+    // JW Player: go through existing instances by index (never creates new ones).
+    const jw = window.jwplayer;
+    if (typeof jw === 'function') {
+      for (let i = 0; i < 50; i++) {
+        let p, box;
+        try { p = jw(i); } catch (e) { break; }
+        if (!p || typeof p.getContainer !== 'function') break;
+        try { box = p.getContainer(); } catch (e) { continue; }
+        if (!box) continue;
+        const media = [...box.querySelectorAll('video, audio')];
+        media.forEach(m => handled.add(m));
+        if (!jwHooked.has(p) && typeof p.on === 'function') {   // react instantly to JW's own mute/volume events
+          try { p.on('mute', schedule); p.on('volume', schedule); jwHooked.add(p); } catch (e) {}
+        }
+        try { if (!fixJW(p)) media.forEach(fixElement); }
+        catch (e) { log('jwplayer error', e); }
+      }
+    }
+
+    // Everything else: any <video>/<audio> on the page (playing or not).
+    document.querySelectorAll('video, audio').forEach(m => {
+      if (!handled.has(m)) fixElement(m);
+    });
+  }
+  const jwHooked = new WeakSet();
+
+  // ---------- stop mutes at the source ----------
+  // JW Player: .jw-volume-mute   YouTube: .ytp-mute-button   (class names are the same in every language)
+  const MUTE_BUTTONS = '.jw-volume-mute, .ytp-mute-button';
+  const isEditable = t => t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+  function swallow(e, why) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (e.type === 'click' || e.type === 'keydown') log('blocked mute', why);
+    schedule();   // and unmute right away in case something got through
+  }
+  if (BLOCK_MUTE) {
+    ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'touchstart', 'touchend'].forEach(ev =>
+      window.addEventListener(ev, e => {
+        const t = e.target;
+        if (t && t.closest && t.closest(MUTE_BUTTONS)) swallow(e, 'button');
+      }, { capture: true, passive: false }));
+    window.addEventListener('keydown', e => {
+      const t = e.target;
+      if (isEditable(t) || e.ctrlKey || e.altKey || e.metaKey) return;
+      if (e.key === 'm' || e.key === 'M') return swallow(e, 'm key');
+      if ((e.key === 'Enter' || e.key === ' ') && t && t.closest && t.closest(MUTE_BUTTONS)) swallow(e, 'button key');
+    }, true);
+  }
+
+  let pending = false;
+  function schedule() {
+    if (pending) return;
+    pending = true;
+    setTimeout(() => {
+      pending = false;
+      try { checkAll(); } catch (e) { log('error', e); }
+    }, 50);
+  }
+
+  // Media events don't bubble, but capture-phase listeners on document still see them.
+  ['play', 'playing', 'volumechange', 'loadedmetadata'].forEach(ev =>
+    document.addEventListener(ev, schedule, true));
+  // First click/keypress unlocks unmuting.
+  ['pointerdown', 'keydown'].forEach(ev => window.addEventListener(ev, schedule, true));
+  setInterval(schedule, CHECK_EVERY_MS);
+  schedule();
+  log('running', { blockMute: BLOCK_MUTE });
+})();
